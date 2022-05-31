@@ -521,7 +521,7 @@ static void dump_hex(u8* buf, u32 len, u8* b_data) {
       SAYF("    Offset %x, length %u: ", i, rlen);
     else
       SAYF("    Offset %u, length %u: ", i, rlen);
-    
+
     switch (rtype) {
 
       case RESP_NONE:     SAYF("no-op block\n"); break;

@@ -6,8 +6,6 @@
 
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
-   Rare branches extension by Caroline Lemieux <clemieux@cs.berkeley.edu>
-
    Copyright 2013, 2014, 2015, 2016, 2017 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,8 +26,6 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
-#define DEBUG1 fileonly
-
 #include "config.h"
 #include "types.h"
 #include "debug.h"
@@ -49,10 +45,6 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
-#include <stdbool.h>
-#include <stdarg.h>
-#include <limits.h>
-
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -143,8 +135,6 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
-
-static u64 hit_bits[MAP_SIZE];        /* @RB@ Hits to every basic block transition */
 
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
@@ -257,8 +247,6 @@ struct queue_entry {
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
-  u8* fuzzed_branches;                /* @RB@ which branches have been done */
-
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
 
@@ -285,37 +273,6 @@ static struct extra_data* a_extras;   /* Automatically selected extras    */
 static u32 a_extras_cnt;              /* Total number of tokens available */
 
 static u8* (*post_handler)(u8* buf, u32* len);
-
-
-/* @RB@ Things about branches */
-
-static u32 vanilla_afl = 1000;      /* @RB@ How many executions to conduct 
-                                         in vanilla AFL mode               */
-static u32 MAX_RARE_BRANCHES = 256;
-static int rare_branch_exp = 4;        /* @RB@ less than 2^rare_branch_exp is rare*/
-
-static int * blacklist; 
-static int blacklist_size = 1024;
-static int blacklist_pos;
-
-static u32 rb_fuzzing = 0;           /* @RB@ non-zero branch index + 1 if fuzzing is being done with that branch constant*/
-static u32 total_branch_tries = 0;
-static u32 successful_branch_tries = 0;
-
-static u8 shadow_mode = 0;           /* @RB@ shadow AFL run -- do not modify
-                                        queue or branch hits             */
-static u8 run_with_shadow = 0;
-
-static u8 use_branch_mask = 1;
-
-static int prev_cycle_wo_new = 0;
-static int cycle_wo_new = 0;
-
-static int bootstrap = 0; /* @RB@ */
-static u8 skip_deterministic_bootstrap = 0;
-
-static int trim_for_branch = 0;
-
 
 /* Interesting values, as per config.h */
 
@@ -364,67 +321,6 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
-
-/* create a new branch mask of the specified size */
-
-static inline u8* alloc_branch_mask(u32 size) {
-
-  u8* mem;
-
-  if (!size) return NULL;
-  mem = ck_alloc_nozero(size);
-
-  memset(mem, 7, size);
-
-  mem[size - 1] = 4;
-
-  return mem;
-
-}
-
-// @LFB@ functions for logging
-void tee2(char const *fmt, ...) { 
-    static FILE *f = NULL;
-    if (f == NULL) {
-      u8 * fn = alloc_printf("%s/min-branch-fuzzing.log", out_dir);
-      f= fopen(fn, "w");
-      ck_free(fn);
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-}
-
-void fileonly (char const *fmt, ...) { 
-    static FILE *f = NULL;
-    if (f == NULL) {
-      u8 * fn = alloc_printf("%s/min-branch-fuzzing.log", out_dir);
-      f= fopen(fn, "w");
-      ck_free(fn);
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-}
-
-
-/* at the end of execution, dump the number of inputs hitting
-   each branch to log */
-static void dump_to_logs() {
-  s32 branch_hit_fd = -1;
-  u8* fn = alloc_printf("%s/branch-hits.bin", out_dir);
-  unlink(fn); /* Ignore errors */
-  branch_hit_fd = open(fn, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-  if (branch_hit_fd < 0) PFATAL("Unable to create '%s'", fn);
-  ck_write(branch_hit_fd, hit_bits, sizeof(u64) * MAP_SIZE, fn);
-  ck_free(fn);
-  close(branch_hit_fd);
-}
 
 /* Get unix time in milliseconds */
 
@@ -874,246 +770,12 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
-/* True if branch_ids contains branch_id*/
-static int contains_id(int branch_id, int* branch_ids){
-  for (int i = 0; branch_ids[i] != -1; i++){
-    if (branch_ids[i] == branch_id) return 1;
-	}
-  return 0; 
-}
-
-/* you'll have to free the return pointer. */
-static int* get_lowest_hit_branch_ids(){
-  int * rare_branch_ids = ck_alloc(sizeof(int) * MAX_RARE_BRANCHES);
-  int lowest_hob = INT_MAX;
-  int ret_list_size = 0;
-
-  for (int i = 0; (i < MAP_SIZE) && (ret_list_size < MAX_RARE_BRANCHES - 1); i++){
-    // ignore unseen branches. sparse array -> unlikely 
-    if (unlikely(hit_bits[i] > 0)){
-      if (contains_id(i, blacklist)) continue;
-      unsigned int long cur_hits = hit_bits[i];
-      int highest_order_bit = 0;
-      while(cur_hits >>=1)
-          highest_order_bit++;
-      lowest_hob = highest_order_bit < lowest_hob ? highest_order_bit : lowest_hob;
-      if (highest_order_bit < rare_branch_exp){
-        // if we are an order of magnitude smaller, prioritize the
-        // rarer branches
-        if (highest_order_bit < rare_branch_exp - 1){
-          rare_branch_exp = highest_order_bit + 1;
-          // everything else that came before had way more hits
-          // than this one, so remove from list
-          ret_list_size = 0;
-        }
-        rare_branch_ids[ret_list_size] = i;
-        ret_list_size++;
-      }
-
-    }
-  }
-
-  if (ret_list_size == 0){
-    DEBUG1("Was returning list of size 0\n");
-    if (lowest_hob != INT_MAX) {
-      rare_branch_exp = lowest_hob + 1;
-      DEBUG1("Upped max exp to %i\n", rare_branch_exp);
-      ck_free(rare_branch_ids);
-      return get_lowest_hit_branch_ids();
-    }
-  }
-
-  rare_branch_ids[ret_list_size] = -1;
-  return rare_branch_ids;
-
-}
-
-/* return 0 if current trace bits hits branch with id branch_id,
-  0 otherwise */
-static int hits_branch(int branch_id){
-  return (trace_bits[branch_id] != 0);
-}
-
-// checks if hits a rare branch with mini trace bits
-// returns NULL if the trace bits does not hit a rare branch
-// else returns a list of all the rare branches hit
-// by the mini trace bits, in decreasing order of rarity
-static u32 * is_rb_hit_mini(u8* trace_bits_mini){
-  int * rarest_branches = get_lowest_hit_branch_ids();
-  u32 * branch_ids = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
-  u32 * branch_cts = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
-  int min_hit_index = 0;
-
-  for (int i = 0; i < MAP_SIZE ; i ++){
-;
-      if (unlikely (trace_bits_mini[i >> 3]  & (1 <<(i & 7)) )){
-        int cur_index = i;
-        int is_rare = contains_id(cur_index, rarest_branches);
-        if (is_rare) {
-          // at loop initialization, set min_branch_hit properly
-          if (!min_hit_index) {
-            branch_cts[min_hit_index] = hit_bits[cur_index];
-            branch_ids[min_hit_index] = cur_index + 1;
-          }
-          // in general just check if we're a smaller branch 
-          // than the previously found min
-          int j;
-          for (j = 0 ; j < min_hit_index; j++){
-            if (hit_bits[cur_index] <= branch_cts[j]){
-              memmove(branch_cts + j + 1, branch_cts + j, min_hit_index -j);
-              memmove(branch_ids + j + 1, branch_ids + j, min_hit_index -j);
-              branch_cts[j] = hit_bits[cur_index];
-              branch_ids[j] = cur_index + 1;
-            }
-          }
-          // append at end
-          if (j == min_hit_index){
-            branch_cts[j] = hit_bits[cur_index];
-            // + 1 so we can distinguish 0 from other cases
-            branch_ids[j] = cur_index + 1;
-
-          }
-          // this is only incremented when is_rare holds, which should
-          // only happen a max of MAX_RARE_BRANCHES -1 times -- the last
-          // time we will never reenter so this is always < MAX_RARE_BRANCHES
-          // at the top of the if statement
-          min_hit_index++;
-        }
-      }
-
-  }
-  ck_free(branch_cts);
-  ck_free(rarest_branches);
-  if (min_hit_index == 0){
-      ck_free(branch_ids);
-      branch_ids = NULL;
-  } else {
-    // 0 terminate the array
-    branch_ids[min_hit_index] = 0;
-  }
-  return branch_ids;
-
-}
-
-/* get a random modifiable position (i.e. where branch_mask & mod_type) 
-   for both overwriting and removal we want to make sure we are overwriting
-   or removing parts within the branch mask
-*/
-// assumes map_len is len, not len + 1. be careful. 
-static u32 get_random_modifiable_posn(u32 num_to_modify, u8 mod_type, u32 map_len, u8* branch_mask, u32 * position_map){
-  u32 ret = 0xffffffff;
-  u32 position_map_len = 0;
-  int prev_start_of_1_block = -1;
-  int in_0_block = 1;
-  for (int i = 0; i < map_len; i ++){
-    if (branch_mask[i] & mod_type){
-      // if the last thing we saw was a zero, set
-      // to start of 1 block
-      if (in_0_block) {
-        prev_start_of_1_block = i;
-        in_0_block = 0;
-      }
-    } else {
-      // for the first 0 we see (unless the eff_map starts with zeroes)
-      // we know the last index was the last 1 in the line
-      if ((!in_0_block) &&(prev_start_of_1_block != -1)){
-        int num_bytes = MAX(num_to_modify/8, 1);
-        for (int j = prev_start_of_1_block; j < i-num_bytes + 1; j++){
-            // I hate this ++ within operator stuff
-            position_map[position_map_len++] = j;
-        }
-
-      }
-      in_0_block = 1;
-    }
-  }
-
-  // if we ended not in a 0 block, add it in too 
-  if (!in_0_block) {
-    u32 num_bytes = MAX(num_to_modify/8, 1);
-    for (u32 j = prev_start_of_1_block; j < map_len-num_bytes + 1; j++){
-        // I hate this ++ within operator stuff
-        position_map[position_map_len++] = j;
-    }
-  }
-
-  if (position_map_len){
-    u32 random_pos = UR(position_map_len);
-    if (num_to_modify >= 8)
-      ret =  position_map[random_pos];
-    else // I think num_to_modify can only ever be 1 if it's less than 8. otherwise need trickier stuff. 
-      ret = position_map[random_pos] + UR(8);
-  } 
-
-  return ret;
-  
-}
-
-// just need a random element of branch_mask which & with 4
-// assumes map_len is len, not len + 1. be careful. 
-static u32 get_random_insert_posn(u32 map_len, u8* branch_mask, u32 * position_map){
-
-  u32 position_map_len = 0;
-  u32 ret = map_len;
-
-  for (u32 i = 0; i <= map_len; i++){
-    if (branch_mask[i] & 4)
-      position_map[position_map_len++] = i;
-  }
-
-  if (position_map_len){
-    ret = position_map[UR(position_map_len)];
-  }
-
-  return ret;
-}
-
-
-// when resuming re-increment hit bits
-static void init_hit_bits() {
-  s32 branch_hit_fd = -1;
-
-  ACTF("Attempting to init hit bits...");
-  u8* fn = alloc_printf("%s/branch-hits.bin", out_dir);
-
-  branch_hit_fd = open(fn, O_RDONLY);
-  if (branch_hit_fd < 0) PFATAL("Unable to open '%s'", fn);
-
-  ck_read(branch_hit_fd, hit_bits, sizeof(u64) * MAP_SIZE, fn);
-
-  close(branch_hit_fd);
-  OKF("Init'ed hit_bits.");
-}
-
-// @RB@ moved up here so we can use it in add_to_queue 
-/* Compact trace bytes into a smaller bitmap. We effectively just drop the
-   count information here. This is called only sporadically, for some
-   new paths. */
-
-static void minimize_bits(u8* dst, u8* src) {
-
-  u32 i = 0;
-
-  while (i < MAP_SIZE) {
-
-    if (*(src++)) dst[i >> 3] |= 1 << (i & 7);
-    i++;
-
-  }
-
-}
 
 /* Append new test case to the queue. */
 
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
-
-  // @RB@ added these for every queue entry
-  q->trace_mini = ck_alloc(MAP_SIZE >> 3);
-  minimize_bits(q->trace_mini, trace_bits);
-  q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
-  // @End
 
   q->fname        = fname;
   q->len          = len;
@@ -1153,10 +815,10 @@ EXP_ST void destroy_queue(void) {
   struct queue_entry *q = queue, *n;
 
   while (q) {
+
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
-    ck_free(q->fuzzed_branches);
     ck_free(q);
     q = n;
 
@@ -1543,6 +1205,24 @@ static void remove_shm(void) {
 }
 
 
+/* Compact trace bytes into a smaller bitmap. We effectively just drop the
+   count information here. This is called only sporadically, for some
+   new paths. */
+
+static void minimize_bits(u8* dst, u8* src) {
+
+  u32 i = 0;
+
+  while (i < MAP_SIZE) {
+
+    if (*(src++)) dst[i >> 3] |= 1 << (i & 7);
+    i++;
+
+  }
+
+}
+
+
 /* When we bump into a new path, we call this to see if the path appears
    more "favorable" than any of the existing ones. The purpose of the
    "favorables" is to have a minimal set of paths that trigger all the bits
@@ -1575,11 +1255,8 @@ static void update_bitmap_score(struct queue_entry* q) {
             previous winner, discard its trace_bits[] if necessary. */
 
          if (!--top_rated[i]->tc_ref) {
-
-          //@RB@ TODO: find a better way to do this
-          // ck_free(top_rated[i]->trace_mini);
-          // top_rated[i]->trace_mini = 0;
-
+           ck_free(top_rated[i]->trace_mini);
+           top_rated[i]->trace_mini = 0;
          }
 
        }
@@ -3044,16 +2721,6 @@ static void perform_dry_run(char** argv) {
     close(fd);
 
     res = calibrate_case(argv, q, use_mem, 0, 1);
-
-    // @RB@ added these for every queue entry
-    // free what was added in add_to_queue
-    ck_free(q->trace_mini);
-    ck_free(q->fuzzed_branches);
-    q->trace_mini = ck_alloc(MAP_SIZE >> 3);
-    minimize_bits(q->trace_mini, trace_bits);
-    q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
-    // @End
-
     ck_free(use_mem);
 
     if (stop_soon) return;
@@ -3443,23 +3110,11 @@ static void write_crash_readme(void) {
 }
 
 
-/* increment hit bits by 1 for every element of trace_bits that has been hit.
- effectively counts that one input has hit each element of trace_bits */
-static void increment_hit_bits(){
-  for (int i = 0; i < MAP_SIZE; i++){
-    if ((trace_bits[i] > 0) && (hit_bits[i] < ULONG_MAX))
-      hit_bits[i]++;
-  }
-}
-
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
-
-  // @RB@TODO: fix this kludge
-  if (len == 0) return 0;
 
   u8  *fn = "";
   u8  hnb;
@@ -3468,16 +3123,13 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   if (fault == crash_mode) {
 
-    /* @RB@ in shadow mode, don't increment hit bits*/
-    if (!shadow_mode) increment_hit_bits();	
-
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
       return 0;
-    }   
+    }    
 
 #ifndef SIMPLE_FILES
 
@@ -3490,31 +3142,27 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 #endif /* ^!SIMPLE_FILES */
 
-    /* @RB@ in shadow mode, don't actuallly add to queue */
-    if (!shadow_mode) { 
-      add_to_queue(fn, len, 0);
+    add_to_queue(fn, len, 0);
 
-      if (hnb == 2) {
-        queue_top->has_new_cov = 1;
-        queued_with_cov++;
-      }
+    if (hnb == 2) {
+      queue_top->has_new_cov = 1;
+      queued_with_cov++;
+    }
 
-      queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+    queue_top->exec_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
-      /* Try to calibrate inline; this also calls update_bitmap_score() when
-         successful. */
+    /* Try to calibrate inline; this also calls update_bitmap_score() when
+       successful. */
 
-      res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
+    res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
 
-      if (res == FAULT_ERROR)
-        FATAL("Unable to execute target application");
+    if (res == FAULT_ERROR)
+      FATAL("Unable to execute target application");
 
-      fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-      if (fd < 0) PFATAL("Unable to create '%s'", fn);
-      ck_write(fd, mem, len, fn);
-
-      close(fd);
-    } 
+    fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) PFATAL("Unable to create '%s'", fn);
+    ck_write(fd, mem, len, fn);
+    close(fd);
 
     keeping = 1;
 
@@ -4951,8 +4599,6 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
 
-  if (vanilla_afl) --vanilla_afl;
-
   if (stop_soon) return 1;
 
   if (fault == FAULT_TMOUT) {
@@ -4975,14 +4621,6 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
-  if (rb_fuzzing){
-    total_branch_tries++;
-    if (hits_branch(rb_fuzzing - 1)){
-      successful_branch_tries++;
-    } else {
-    }
-  }
-
   /* This handles FAULT_ERROR for us: */
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
@@ -4994,108 +4632,6 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
 }
 
-
-/* Trim for a particular branch. Possibly modified contents of
-   in_bur, and returns the new in_len. */
-
-
-static u32 trim_case_rb(char** argv, u8* in_buf, u32 in_len, u8* out_buf) {
-
-  DEBUG1 ("entering RB trim, len is %i\n", in_len);
-
-  if (rb_fuzzing == 0){
-    // @RB@ this should not happen. 
-    return in_len;
-  }
-
-  static u8 tmp[64];
-
-  u8  fault = 0;
-  u32 trim_exec = 0;
-  u32 remove_len;
-  u32 len_p2;
-
-  /* Although the trimmer will be less useful when variable behavior is
-     detected, it will still work to some extent, so we don't check for
-     this. */
-
-  if (in_len < 5) return 0;
-
-  stage_name = tmp;
-  stage_short= "rbtrim";
-  // CAROTODO: what is this, update later
-  //bytes_trim_in += in_len;
-
-  /* Select initial chunk len, starting with large steps. */
-
-  len_p2 = next_p2(in_len);
-
-  // CAROTODO: could make TRIM_START_STEPS smaller   
-  remove_len = MAX(len_p2 / TRIM_START_STEPS, TRIM_MIN_BYTES);
-
-  /* Continue until the number of steps gets too high or the stepover
-     gets too small. */
-
-  while (remove_len >= MAX(len_p2 / TRIM_END_STEPS, TRIM_MIN_BYTES)) {
-
-    // why doesn't this start at 0?
-    // u32 remove_pos = remove_len;
-    u32 remove_pos = 0;
-
-    sprintf(tmp, "rb trim %s/%s", DI(remove_len), DI(remove_len));
-
-    stage_cur = 0;
-    stage_max = in_len / remove_len;
-
-    while (remove_pos < in_len) {
-
-      u32 trim_avail = MIN(remove_len, in_len - remove_pos);
-
-      //write_with_gap(in_buf, q->len, remove_pos, trim_avail);
-      // HEAD
-      memcpy(out_buf, in_buf, remove_pos);
-      // TAIL
-      memcpy(out_buf + remove_pos, in_buf + remove_pos + trim_avail, in_len - remove_pos - trim_avail);
-
-      // not actually fault...
-      /* using common fuzz stuff prevents us from having to mess with
-         permanent changes to the queue */
-      fault = common_fuzz_stuff(argv, out_buf, in_len - trim_avail);
-   
-      // Not sure if we want this given that fault is no longer a fault
-      if (stop_soon || fault == FAULT_ERROR) goto abort_rb_trimming;
-
-      // if successfully hit branch of interest...
-      if (hits_branch(rb_fuzzing - 1)) {
-        // (0) calclength of tail
-        u32 move_tail = in_len - remove_pos - trim_avail;
-        // (1) reduce length by how much was trimmed
-        in_len -= trim_avail;
-
-        // (2) update the closest power of 2 len
-        len_p2  = next_p2(in_len);
-        memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail, 
-                move_tail);
-          
-      } else remove_pos += remove_len;
-
-
-      if (!(trim_exec++ % stats_update_freq)) show_stats();
-      stage_cur++;
-      /* Note that we don't keep track of crashes or hangs here; maybe TODO? */
-      }
-
-
-    remove_len >>= 1;
-    }
-  
-abort_rb_trimming:
-  //@RM@ TODO: update later
- // bytes_trim_out += in_len;
-  DEBUG1 ("output of rb trimming has len %i\n", in_len);
-  return in_len;
-
-}
 
 /* Helper to choose random block len for block operations in fuzz_one().
    Doesn't return zero, provided that max_len is > 0. */
@@ -5118,6 +4654,7 @@ static u32 choose_block_len(u32 limit) {
              break;
 
     default: 
+
              if (UR(10)) {
 
                min_value = HAVOC_BLK_MEDIUM;
@@ -5412,36 +4949,6 @@ static u8 fuzz_one(char** argv) {
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
 
-  /* RB Vars*/
-  u8 * branch_mask = 0;
-  u8 * orig_branch_mask = 0;
-  u8 rb_skip_deterministic = 0;
-  u8 skip_simple_bitflip = 0;
-  u8 * virgin_virgin_bits = 0;
-  char * shadow_prefix = "";
-  u32 * position_map = NULL;
-  u32 orig_queued_with_cov = queued_with_cov;
-  u32 orig_queued_discovered = queued_discovered;
-  u32 orig_total_execs = total_execs;
-  
-
-  if (!vanilla_afl){
-    if (prev_cycle_wo_new && bootstrap){
-      vanilla_afl = 1;
-      rb_fuzzing = 0;
-      if (bootstrap == 2){
-        skip_deterministic_bootstrap = 1;
-
-      }
-    }
-
-  }
-
- if (skip_deterministic){
-  rb_skip_deterministic = 1;
-  skip_simple_bitflip = 1;
- }
-
 #ifdef IGNORE_FINDS
 
   /* In IGNORE_FINDS mode, skip any entries that weren't in the
@@ -5451,109 +4958,34 @@ static u8 fuzz_one(char** argv) {
 
 #else
 
-  if (vanilla_afl){
+  if (pending_favored) {
 
-    if (pending_favored) {
+    /* If we have any favored, non-fuzzed new arrivals in the queue,
+       possibly skip to them at the expense of already-fuzzed or non-favored
+       cases. */
 
-      /* If we have any favored, non-fuzzed new arrivals in the queue,
-         possibly skip to them at the expense of already-fuzzed or non-favored
-         cases. */
+    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
+        UR(100) < SKIP_TO_NEW_PROB) return 1;
 
-      if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-          UR(100) < SKIP_TO_NEW_PROB) return 1;
+  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
 
-    } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+    /* Otherwise, still possibly skip non-favored cases, albeit less often.
+       The odds of skipping stuff are higher for already-fuzzed inputs and
+       lower for never-fuzzed entries. */
 
-      /* Otherwise, still possibly skip non-favored cases, albeit less often.
-         The odds of skipping stuff are higher for already-fuzzed inputs and
-         lower for never-fuzzed entries. */
+    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
 
-      if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
+      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
 
-        if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+    } else {
 
-      } else {
-
-        if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-      }
+      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
 
     }
 
   }
 
 #endif /* ^IGNORE_FINDS */
-
-  /* select inputs which hit rare branches */
-  if (!vanilla_afl) {
-    skip_deterministic_bootstrap = 0;
-    u32 * min_branch_hits = is_rb_hit_mini(queue_cur->trace_mini);
-
-    if (min_branch_hits == NULL){
-      // not a rare hit. don't fuzz.
-      return 1;
-    } else { 
-      int ii;
-      for (ii = 0; min_branch_hits[ii] != 0; ii++){
-        rb_fuzzing = min_branch_hits[ii];
-        if (rb_fuzzing){
-          int byte_offset = (rb_fuzzing - 1) >> 3;
-          int bit_offset = (rb_fuzzing - 1) & 7;
-
-          // skip deterministic if we have fuzzed this min branch
-          if (queue_cur->fuzzed_branches[byte_offset] & (1 << (bit_offset))){
-            // let's try the next one
-            continue;
-          } else {
-            for (int k = 0; k < MAP_SIZE >> 3; k ++){
-              if (queue_cur->fuzzed_branches[k] != 0){
-                DEBUG1("We fuzzed this guy already\n");
-                skip_simple_bitflip = 1;
-                break;
-              }
-            }
-            // indicate we have fuzzed this branch id
-            queue_cur->fuzzed_branches[byte_offset] |= (1 << (bit_offset)); 
-            // chose minimum
-            break;
-          }
-        } else break; 
-      }
-      // if we got to the end of min_branch_hits...
-      // it's either because we fuzzed all the things in min_branch_hits
-      // or because there was nothing. If there was nothing, 
-      // min_branch_hits[0] should be 0 
-      if (!rb_fuzzing || (min_branch_hits[ii] == 0)){
-        rb_fuzzing = min_branch_hits[0];
-        if (!rb_fuzzing) {
-          return 1;
-        }
-        DEBUG1("We fuzzed this guy already for real\n");
-        skip_simple_bitflip = 1;
-        rb_skip_deterministic = 1;
-      }
-      ck_free(min_branch_hits);
-
-    if (!skip_simple_bitflip){
-      cycle_wo_new = 0; 
-    }
-    //rarest_branches = get_lowest_hit_branch_ids();
-    //DEBUG1("---\ncurrent rarest branches: ");
-    //for (int k = 0; rarest_branches[k] != -1 ; k++){
-    //  DEBUG1("%i (%u) ", rarest_branches[k], hit_bits[rarest_branches[k]]);
-    //}
-    //DEBUG1("\n");
-
-    DEBUG1("Trying to fuzz input %s: \n", queue_cur->fname);
-    //for (int k = 0; k < len; k++) DEBUG1("%c", out_buf[k]);
-    //DEBUG1("\n");
-
-
-    DEBUG1("which hit branch %i (hit by %u inputs) \n", rb_fuzzing -1, hit_bits[rb_fuzzing -1]);
-    //ck_free(rarest_branches);
-   
-    }
-  }
 
   if (not_on_tty) {
     ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
@@ -5633,31 +5065,6 @@ static u8 fuzz_one(char** argv) {
 
   }
 
-  /***************
-  *  @RB@ TRIM  *
-  ***************/
-
-  u32 orig_bitmap_size = queue_cur->bitmap_size;
-  u64 orig_exec_us = queue_cur->exec_us;
-
-  if (rb_fuzzing && trim_for_branch) {
-
-    u32 trim_len = trim_case_rb(argv, in_buf, len, out_buf);
-    if (trim_len > 0){
-      len = trim_len;
-      /* this is kind of an unfair time measurement because the
-         one in calibrate includes a lot of other loop stuff*/
-      u64 start_time = get_cur_time_us();
-      write_to_testcase(in_buf, len);
-      run_target(argv, exec_tmout);
-      /* we are setting these to get a more accurate performance score */
-      queue_cur->exec_us = get_cur_time_us() - start_time;
-      queue_cur->bitmap_size = count_bytes(trace_bits);
-
-    }
-
-  }
-
   memcpy(out_buf, in_buf, len);
 
   /*********************
@@ -5665,77 +5072,19 @@ static u8 fuzz_one(char** argv) {
    *********************/
 
   orig_perf = perf_score = calculate_score(queue_cur);
-  /* @RB@ */
-  orig_total_execs = total_execs;
-
-  if (rb_fuzzing && trim_for_branch){
-    /* restoring these because the changes to the test case 
-     were not permanent */
-    queue_cur->bitmap_size = orig_bitmap_size;
-    queue_cur->exec_us =  orig_exec_us;
-  }
-
-
-  /* @RB@ */
-re_run: // re-run when running in shadow mode
-  if (rb_fuzzing){
-    if (run_with_shadow && !shadow_mode){
-      shadow_mode = 1;
-      virgin_virgin_bits = ck_alloc(MAP_SIZE);
-      memcpy(virgin_virgin_bits, virgin_bits, MAP_SIZE);
-      shadow_prefix = "PLAIN AFL: ";
-    } else if (run_with_shadow && shadow_mode) {
-      // reset all stats. nothing is added to queue.  
-      shadow_mode = 0;
-      queued_discovered = orig_queued_discovered;
-      queued_with_cov = orig_queued_with_cov;
-      perf_score = orig_perf; //NOTE: this line is not stricly necessary. 
-      total_execs = orig_total_execs;
-      memcpy(virgin_bits, virgin_virgin_bits, MAP_SIZE);
-      ck_free(virgin_virgin_bits);
-      shadow_prefix = "RB: ";
-    }
-
-  }
-
-  // @RB@: allocate the branch mask
-
-  if (vanilla_afl || shadow_mode || (use_branch_mask == 0)){
-      branch_mask = alloc_branch_mask(len + 1);
-      orig_branch_mask = alloc_branch_mask(len + 1);
-  } else {
-      branch_mask = ck_alloc(len + 1);
-      orig_branch_mask = ck_alloc(len + 1);
-  }
-  // this will be used to store the valid modifiable positions
-  // in the havoc stage. malloc'ing once to reduce overhead. 
-  position_map = ck_alloc(sizeof(u32) * (len+1));
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
      testing in earlier, resumed runs (passed_det). */
 
-  if ((!rb_fuzzing && skip_deterministic) || skip_deterministic_bootstrap || (vanilla_afl && queue_cur->was_fuzzed ) || (vanilla_afl && queue_cur->passed_det))
+  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
      for this master instance. */
 
-  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1) {
-    if (!rb_fuzzing || shadow_mode) goto havoc_stage;
-    // skip all but branch mask creation if we're RB fuzzing
-    else {
-      rb_skip_deterministic=1; 
-      skip_simple_bitflip=1;
-    }
-  }  
-
-
-  /* Skip simple bitflip if we've done it already */
-  if (skip_simple_bitflip) {
-    new_hit_cnt = queued_paths + unique_crashes;
-    goto skip_simple_bitflip;
-  }
+  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+    goto havoc_stage;
 
   doing_det = 1;
 
@@ -5845,15 +5194,63 @@ re_run: // re-run when running in shadow mode
   stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP1] += stage_max;
 
-  /* @RB@ */
-  DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  /* Two walking bits. */
 
+  stage_name  = "bitflip 2/1";
+  stage_short = "flip2";
+  stage_max   = (len << 3) - 1;
 
-skip_simple_bitflip:
+  orig_hit_cnt = new_hit_cnt;
 
-  successful_branch_tries = 0;
-  total_branch_tries = 0;
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP2]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP2] += stage_max;
+
+  /* Four walking bits. */
+
+  stage_name  = "bitflip 4/1";
+  stage_short = "flip4";
+  stage_max   = (len << 3) - 3;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP4] += stage_max;
 
   /* Effector map setup. These macros calculate:
 
@@ -5894,11 +5291,6 @@ skip_simple_bitflip:
     out_buf[stage_cur] ^= 0xFF;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-
-    if (rb_fuzzing && !shadow_mode && use_branch_mask > 0)
-      if (hits_branch(rb_fuzzing - 1)){
-        branch_mask[stage_cur] = 1;
-     }
 
     /* We also use this stage to pull off a simple trick: we identify
        bytes that seem to have no effect on the current execution path
@@ -5952,169 +5344,6 @@ skip_simple_bitflip:
   stage_finds[STAGE_FLIP8]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP8] += stage_max;
 
-  /* @RB@ also figure out add/delete map in this stage */
-  if (rb_fuzzing && !shadow_mode && use_branch_mask > 0){
-    
-    // buffer to clobber with new things
-    u8* tmp_buf = ck_alloc(len+1);
-
-    // check if we can delete this byte
-    stage_short = "rbrem8";
-    for (stage_cur = 0; stage_cur < len; stage_cur++) {
-      /* delete current byte */
-      stage_cur_byte = stage_cur;
-    
-      /* head */
-      memcpy(tmp_buf, out_buf, stage_cur);
-      /* tail */
-      memcpy(tmp_buf + stage_cur, out_buf + 1 + stage_cur, len - stage_cur - 1 );
-
-      if (common_fuzz_stuff(argv, tmp_buf, len - 1)) goto abandon_entry;
-
-      /* if even with this byte deleted we hit the branch, can delete here */
-      if (hits_branch(rb_fuzzing - 1)){
-        branch_mask[stage_cur] += 2;
-      }
-    }
-
-    // check if we can add at this byte
-    stage_short = "rbadd8";
-    for (stage_cur = 0; stage_cur <= len; stage_cur++) {
-      /* add random byte */
-      stage_cur_byte = stage_cur;
-      /* head */
-      memcpy(tmp_buf, out_buf, stage_cur);
-      tmp_buf[stage_cur] = UR(256);
-      /* tail */
-      memcpy(tmp_buf + stage_cur + 1, out_buf + stage_cur, len - stage_cur);
-
-      if (common_fuzz_stuff(argv, tmp_buf, len + 1)) goto abandon_entry;
-
-      /* if adding before still hit branch, can add */
-      if (hits_branch(rb_fuzzing - 1)){
-        branch_mask[stage_cur] += 4;
-      }
-
-    }
-
-    ck_free(tmp_buf);
-    // save the original branch mask for after the havoc stage 
-    memcpy (orig_branch_mask, branch_mask, len + 1);
-  }
-
-  if (rb_fuzzing && (successful_branch_tries == 0)){
-    if (blacklist_pos >= blacklist_size -1){
-      DEBUG1("Increasing size of blacklist from %d to %d\n", blacklist_size, blacklist_size*2);
-      blacklist_size = 2 * blacklist_size; 
-      blacklist = ck_realloc(blacklist, sizeof(int) * blacklist_size);
-      if (!blacklist){
-        PFATAL("Failed to realloc blacklist");
-      }
-    }
-    blacklist[blacklist_pos++] = rb_fuzzing -1;
-    blacklist[blacklist_pos] = -1;
-    DEBUG1("adding branch %i to blacklist\n", rb_fuzzing-1);
-  }
-  /* @RB@ reset stats for debugging*/
-  DEBUG1("%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
-  DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
-  successful_branch_tries = 0;
-  total_branch_tries = 0;
-
-  // @RB@ TODO: skip to havoc (or dictionary add?) if can't modify any bytes 
-
-  if (rb_skip_deterministic) goto havoc_stage;
-
-  /* Two walking bits. */
-
-  stage_name  = "bitflip 2/1";
-  stage_short = "flip2";
-  stage_max   = (len << 3) - 1;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (stage_cur = 0; stage_cur < (len << 3) - 1; stage_cur++) {
-
-    stage_cur_byte = stage_cur >> 3;
-
-    if (rb_fuzzing){ //&& use_mask()){
-      // only run modified case if it won't produce garbage
-
-      if (!(branch_mask[stage_cur_byte] & 1)) {
-        stage_max--;
-        continue;
-      }
-
-      // if we're spilling into next byte, check that that byte can
-      // be modified
-      if ((stage_cur_byte != ((stage_cur + 1)>> 3))&& (!(branch_mask[stage_cur_byte + 1] & 1))){
-        stage_max--;
-        continue;
-      }
-    }
-
-    FLIP_BIT(out_buf, stage_cur);
-    FLIP_BIT(out_buf, stage_cur + 1);
-
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-
-    FLIP_BIT(out_buf, stage_cur);
-    FLIP_BIT(out_buf, stage_cur + 1);
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_FLIP2]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_FLIP2] += stage_max;
-
-  /* Four walking bits. */
-
-  stage_name  = "bitflip 4/1";
-  stage_short = "flip4";
-  stage_max   = (len << 3) - 3;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (stage_cur = 0; stage_cur < (len << 3) - 3; stage_cur++) {
-
-    stage_cur_byte = stage_cur >> 3;
-
-    if (rb_fuzzing){//&& use_mask()){
-      // only run modified case if it won't produce garbage
-      if (!(branch_mask[stage_cur_byte] & 1)) {
-        stage_max--;
-        continue;
-      }
-
-      // if we're spilling into next byte, check that that byte can
-      // be modified
-      if ((stage_cur_byte != ((stage_cur + 3)>> 3))&& (!(branch_mask[stage_cur_byte + 1] & 1))){
-        stage_max--;
-        continue;
-      }
-    }
-
-    FLIP_BIT(out_buf, stage_cur);
-    FLIP_BIT(out_buf, stage_cur + 1);
-    FLIP_BIT(out_buf, stage_cur + 2);
-    FLIP_BIT(out_buf, stage_cur + 3);
-
-    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-
-    FLIP_BIT(out_buf, stage_cur);
-    FLIP_BIT(out_buf, stage_cur + 1);
-    FLIP_BIT(out_buf, stage_cur + 2);
-    FLIP_BIT(out_buf, stage_cur + 3);
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_FLIP4] += stage_max;
-
   /* Two walking bytes. */
 
   if (len < 2) goto skip_bitflip;
@@ -6133,14 +5362,6 @@ skip_simple_bitflip:
     if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
       stage_max--;
       continue;
-    }
-
-    if (rb_fuzzing ){
-      // skip if either byte will modify the branch
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1) ){
-        stage_max--;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6178,16 +5399,6 @@ skip_simple_bitflip:
         !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
       stage_max--;
       continue;
-    }
-
-
-    if (rb_fuzzing){
-      // skip if either byte will modify the branch
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
-            !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1) ){
-        stage_max--;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6234,13 +5445,6 @@ skip_bitflip:
     if (!eff_map[EFF_APOS(i)]) {
       stage_max -= 2 * ARITH_MAX;
       continue;
-    }
-
-    if (rb_fuzzing){
-      if (!(branch_mask[i]& 1) ){
-        stage_max -= 2 * ARITH_MAX;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6305,13 +5509,6 @@ skip_bitflip:
     if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
       stage_max -= 4 * ARITH_MAX;
       continue;
-    }
-
-    if (rb_fuzzing){
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1)){
-        stage_max -= 4 * ARITH_MAX;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6407,15 +5604,6 @@ skip_bitflip:
         !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
       stage_max -= 4 * ARITH_MAX;
       continue;
-    }
-
-    if (rb_fuzzing ){
-      // skip if either byte will modify the branch
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
-            !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1)){
-        stage_max -= 4 * ARITH_MAX;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6515,13 +5703,6 @@ skip_arith:
       continue;
     }
 
-    if (rb_fuzzing ){
-      if (!(branch_mask[i]& 1)){
-        stage_max -= sizeof(interesting_8);
-        continue;
-      }
-    }
-
     stage_cur_byte = i;
 
     for (j = 0; j < sizeof(interesting_8); j++) {
@@ -6572,16 +5753,6 @@ skip_arith:
       stage_max -= sizeof(interesting_16);
       continue;
     }
-
-
-    if (rb_fuzzing ){
-      // skip if either byte will modify the branch
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1)){
-        stage_max -= sizeof(interesting_16);
-        continue;
-      }
-    }
-
 
     stage_cur_byte = i;
 
@@ -6650,15 +5821,6 @@ skip_arith:
         !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
       stage_max -= sizeof(interesting_32) >> 1;
       continue;
-    }
-
-    if (rb_fuzzing ){
-      // skip if any byte will modify the branch
-      if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
-            !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1)){
-        stage_max -= sizeof(interesting_32) >> 1;
-        continue;
-      }
     }
 
     stage_cur_byte = i;
@@ -6751,22 +5913,7 @@ skip_interest:
 
         stage_max--;
         continue;
-      }
- 
-      if (rb_fuzzing ){//&& use_mask()){
-      // if any fall outside the mask, skip
-        int bailing = 0;
-        for (int ii = 0; ii < extras[j].len; ii ++){
-          if (!(branch_mask[i + ii] & 1)){
-            bailing = 1;
-            break;
-          }
 
-        }
-        if (bailing){
-          stage_max--;
-          continue;
-        }        
       }
 
       last_len = extras[j].len;
@@ -6807,12 +5954,6 @@ skip_interest:
 
       if (len + extras[j].len > MAX_FILE) {
         stage_max--; 
-        continue;
-      }
-
-      // consult insert map....
-      if (!(branch_mask[i] & 4) ){
-        stage_max--;
         continue;
       }
 
@@ -6875,23 +6016,6 @@ skip_user_extras:
 
       }
 
-      // if any fall outside the mask, skip
-      if (rb_fuzzing){ 
-      // if any fall outside the mask, skip
-        int bailing = 0;
-        for (int ii = 0; ii < a_extras[j].len; ii ++){
-          if (!(branch_mask[i + ii] & 1)){
-            bailing = 1;
-            break;
-          }
-
-        }
-        if (bailing){
-          stage_max--;
-          continue;
-        }        
-      }
-
       last_len = a_extras[j].len;
       memcpy(out_buf + i, a_extras[j].data, last_len);
 
@@ -6919,20 +6043,12 @@ skip_extras:
 
   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
 
-  /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
-  DEBUG1("%sdet stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%sdet stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
-
-  successful_branch_tries = 0;
-  total_branch_tries = 0;
-
   /****************
    * RANDOM HAVOC *
    ****************/
 
 havoc_stage:
-   
+
   stage_cur_byte = -1;
 
   /* The havoc stage mutation code is also invoked when splicing files; if the
@@ -6972,7 +6088,6 @@ havoc_stage:
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
     u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
-    u32 posn;
 
     stage_cur_val = use_stacking;
  
@@ -6984,17 +6099,14 @@ havoc_stage:
 
           /* Flip a single bit somewhere. Spooky! */
 
-          if((posn = get_random_modifiable_posn(1, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-          FLIP_BIT(out_buf, posn);
-
+          FLIP_BIT(out_buf, UR(temp_len << 3));
           break;
 
         case 1: 
 
           /* Set byte to interesting value. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-          out_buf[posn] = interesting_8[UR(sizeof(interesting_8))];
+          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
           break;
 
         case 2:
@@ -7003,15 +6115,14 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
           if (UR(2)) {
 
-            *(u16*)(out_buf + posn) =
+            *(u16*)(out_buf + UR(temp_len - 1)) =
               interesting_16[UR(sizeof(interesting_16) >> 1)];
 
           } else {
 
-            *(u16*)(out_buf + posn) = SWAP16(
+            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
               interesting_16[UR(sizeof(interesting_16) >> 1)]);
 
           }
@@ -7024,16 +6135,14 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
           if (UR(2)) {
   
-            *(u32*)(out_buf + posn) =
+            *(u32*)(out_buf + UR(temp_len - 3)) =
               interesting_32[UR(sizeof(interesting_32) >> 2)];
 
           } else {
 
-
-            *(u32*)(out_buf + posn) = SWAP32(
+            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
               interesting_32[UR(sizeof(interesting_32) >> 2)]);
 
           }
@@ -7044,16 +6153,14 @@ havoc_stage:
 
           /* Randomly subtract from byte. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-          out_buf[posn] -= 1 + UR(ARITH_MAX);
+          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
           break;
 
         case 5:
 
           /* Randomly add to byte. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-          out_buf[posn] += 1 + UR(ARITH_MAX);
+          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
           break;
 
         case 6:
@@ -7062,18 +6169,19 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-
           if (UR(2)) {
 
-            *(u16*)(out_buf + posn) -= 1 + UR(ARITH_MAX);
+            u32 pos = UR(temp_len - 1);
+
+            *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
-    
+
+            u32 pos = UR(temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
-            *(u16*)(out_buf + posn) =
-              SWAP16(SWAP16(*(u16*)(out_buf + posn)) - num);
+            *(u16*)(out_buf + pos) =
+              SWAP16(SWAP16(*(u16*)(out_buf + pos)) - num);
 
           }
 
@@ -7085,18 +6193,19 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-
           if (UR(2)) {
 
-            *(u16*)(out_buf + posn) += 1 + UR(ARITH_MAX);
+            u32 pos = UR(temp_len - 1);
+
+            *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
+            u32 pos = UR(temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
-            *(u16*)(out_buf + posn) =
-              SWAP16(SWAP16(*(u16*)(out_buf + posn)) + num);
+            *(u16*)(out_buf + pos) =
+              SWAP16(SWAP16(*(u16*)(out_buf + pos)) + num);
 
           }
 
@@ -7108,18 +6217,19 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-
           if (UR(2)) {
 
-            *(u32*)(out_buf + posn) -= 1 + UR(ARITH_MAX);
+            u32 pos = UR(temp_len - 3);
+
+            *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
+            u32 pos = UR(temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
-            *(u32*)(out_buf + posn) =
-              SWAP32(SWAP32(*(u32*)(out_buf + posn)) - num);
+            *(u32*)(out_buf + pos) =
+              SWAP32(SWAP32(*(u32*)(out_buf + pos)) - num);
 
           }
 
@@ -7131,18 +6241,19 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-
           if (UR(2)) {
 
-            *(u32*)(out_buf + posn) += 1 + UR(ARITH_MAX);
+            u32 pos = UR(temp_len - 3);
+
+            *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
+            u32 pos = UR(temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
-            *(u32*)(out_buf + posn) =
-              SWAP32(SWAP32(*(u32*)(out_buf + posn)) + num);
+            *(u32*)(out_buf + pos) =
+              SWAP32(SWAP32(*(u32*)(out_buf + pos)) + num);
 
           }
 
@@ -7154,13 +6265,11 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
-          out_buf[posn] ^= 1 + UR(255);
+          out_buf[UR(temp_len)] ^= 1 + UR(255);
           break;
 
-
         case 11 ... 12: {
-            
+
             /* Delete bytes. We're making this a bit more likely
                than insertion (the next option) in hopes of keeping
                files reasonably small. */
@@ -7173,15 +6282,10 @@ havoc_stage:
 
             del_len = choose_block_len(temp_len - 1);
 
-            del_from = get_random_modifiable_posn(del_len*8, 2, temp_len, branch_mask, position_map);
-            if (del_from == 0xffffffff) break;
+            del_from = UR(temp_len - del_len + 1);
 
             memmove(out_buf + del_from, out_buf + del_from + del_len,
                     temp_len - del_from - del_len);
-            // remove that data from the branch mask
-            // the +1 copies over the last part of branch_mask
-            memmove(branch_mask + del_from, branch_mask + del_from + del_len,
-                    temp_len - del_from - del_len + 1);
 
             temp_len -= del_len;
 
@@ -7190,14 +6294,14 @@ havoc_stage:
           }
 
         case 13:
-          
+
           if (temp_len + HAVOC_BLK_XL < MAX_FILE) {
+
             /* Clone bytes (75%) or insert a block of constant bytes (25%). */
-  
-            u8 actually_clone = UR(4);
+
+            u8  actually_clone = UR(4);
             u32 clone_from, clone_to, clone_len;
             u8* new_buf;
-            u8* new_branch_mask; 
 
             if (actually_clone) {
 
@@ -7205,20 +6309,19 @@ havoc_stage:
               clone_from = UR(temp_len - clone_len + 1);
 
             } else {
-              clone_len = choose_block_len(HAVOC_BLK_LARGE);
+
+              clone_len = choose_block_len(HAVOC_BLK_XL);
               clone_from = 0;
+
             }
 
-            clone_to   = get_random_insert_posn(temp_len, branch_mask, position_map);
-   
-            if (clone_to == 0xffffffff) break; // this shouldn't happen, probably...
+            clone_to   = UR(temp_len);
 
             new_buf = ck_alloc_nozero(temp_len + clone_len);
-            new_branch_mask = alloc_branch_mask(temp_len + clone_len + 1);
 
             /* Head */
+
             memcpy(new_buf, out_buf, clone_to);
-            memcpy(new_branch_mask, branch_mask, clone_to);
 
             /* Inserted part */
 
@@ -7231,20 +6334,11 @@ havoc_stage:
             /* Tail */
             memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
                    temp_len - clone_to);
-            memcpy(new_branch_mask + clone_to + clone_len, branch_mask + clone_to,
-                   temp_len - clone_to + 1);
 
             ck_free(out_buf);
-            ck_free(branch_mask);
-
             out_buf = new_buf;
-            branch_mask = new_branch_mask;
-
             temp_len += clone_len;
 
-            position_map = ck_realloc(position_map, sizeof (u32) * (temp_len + 1));
-            if (!position_map)
-              PFATAL("Failure resizing position_map.\n");
           }
 
           break;
@@ -7261,10 +6355,7 @@ havoc_stage:
             copy_len  = choose_block_len(temp_len - 1);
 
             copy_from = UR(temp_len - copy_len + 1);
-
-            copy_to   = get_random_modifiable_posn(copy_len * 8, 1, temp_len, branch_mask, position_map);
-
-            if (copy_to == 0xffffffff) break;
+            copy_to   = UR(temp_len - copy_len + 1);
 
             if (UR(4)) {
 
@@ -7296,9 +6387,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map);
-              if (insert_at == 0xffffffff) break;
-
+              insert_at = UR(temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
 
             } else {
@@ -7311,10 +6400,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-
-              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map);
-              if (insert_at == 0xffffffff) break;
-
+              insert_at = UR(temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
 
             }
@@ -7325,9 +6411,8 @@ havoc_stage:
 
         case 16: {
 
-            u32 use_extra, extra_len, insert_at = get_random_insert_posn(temp_len, branch_mask, position_map);
-             if (insert_at == 0xffffffff) break;
-            u8* new_buf, * new_branch_mask;
+            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
+            u8* new_buf;
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
                previous case. */
@@ -7336,15 +6421,13 @@ havoc_stage:
 
               use_extra = UR(a_extras_cnt);
               extra_len = a_extras[use_extra].len;
-  
+
               if (temp_len + extra_len >= MAX_FILE) break;
 
               new_buf = ck_alloc_nozero(temp_len + extra_len);
-              new_branch_mask = alloc_branch_mask(temp_len + extra_len + 1);
 
               /* Head */
               memcpy(new_buf, out_buf, insert_at);
-              memcpy(new_branch_mask, branch_mask, insert_at);
 
               /* Inserted part */
               memcpy(new_buf + insert_at, a_extras[use_extra].data, extra_len);
@@ -7358,13 +6441,8 @@ havoc_stage:
 
               new_buf = ck_alloc_nozero(temp_len + extra_len);
 
-              new_branch_mask = alloc_branch_mask(temp_len + extra_len + 1);
-
-
               /* Head */
               memcpy(new_buf, out_buf, insert_at);
-              memcpy(new_branch_mask, branch_mask, insert_at);
-
 
               /* Inserted part */
               memcpy(new_buf + insert_at, extras[use_extra].data, extra_len);
@@ -7375,19 +6453,9 @@ havoc_stage:
             memcpy(new_buf + insert_at + extra_len, out_buf + insert_at,
                    temp_len - insert_at);
 
-            memcpy(new_branch_mask + insert_at + extra_len, branch_mask + insert_at,
-                   temp_len - insert_at + 1);
-
             ck_free(out_buf);
-            ck_free(branch_mask);
-            branch_mask = new_branch_mask;
-
             out_buf   = new_buf;
             temp_len += extra_len;
-
-            position_map = ck_realloc(position_map, sizeof (u32) * (temp_len + 1));
-            if (!position_map)
-              PFATAL("Failure resizing position_map.\n");
 
             break;
 
@@ -7402,17 +6470,10 @@ havoc_stage:
 
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
-    if (temp_len < len) {
-      out_buf = ck_realloc(out_buf, len);
-      branch_mask = ck_realloc(branch_mask, len + 1);
-      position_map = ck_realloc(position_map, sizeof (u32) * (len + 1));
-      if (!position_map)
-        PFATAL("Failure resizing position_map.\n");
-    }
+
+    if (temp_len < len) out_buf = ck_realloc(out_buf, len);
     temp_len = len;
     memcpy(out_buf, in_buf, len);
-    memcpy(branch_mask, orig_branch_mask, len + 1);
-
 
     /* If we're finding new stuff, let's run for a bit longer, limits
        permitting. */
@@ -7458,8 +6519,7 @@ retry_splicing:
 
     struct queue_entry* target;
     u32 tid, split_at;
-    u8* new_buf, *new_branch_mask;
-
+    u8* new_buf;
     s32 f_diff, l_diff;
 
     /* First of all, if we've modified in_buf for havoc, let's clean that
@@ -7527,21 +6587,6 @@ retry_splicing:
     out_buf = ck_alloc_nozero(len);
     memcpy(out_buf, in_buf, len);
 
-    // @RB@ handle the branch mask...
-
-    new_branch_mask = alloc_branch_mask(len + 1);
-
-    memcpy(new_branch_mask, branch_mask, MIN(split_at, temp_len + 1));
-    ck_free(branch_mask);
-    branch_mask = new_branch_mask;
-    ck_free(orig_branch_mask);
-    orig_branch_mask = ck_alloc(len +1);
-    //ck_realloc(orig_branch_mask, len + 1);
-    memcpy (orig_branch_mask, branch_mask, len + 1);
-    position_map = ck_realloc(position_map, sizeof (u32) * (len + 1));
-    if (!position_map)
-      PFATAL("Failure resizing position_map.\n");
-
     goto havoc_stage;
 
   }
@@ -7563,30 +6608,11 @@ abandon_entry:
     if (queue_cur->favored) pending_favored--;
   }
 
-  /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
-  successful_branch_tries = 0;
-  total_branch_tries = 0;
-  DEBUG1("%shavoc stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%shavoc stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
-  if (shadow_mode) goto re_run;
-
-  if (queued_with_cov-orig_queued_with_cov){
-    prev_cycle_wo_new = 0;
-    vanilla_afl = 0;
-    cycle_wo_new = 0;
-  }
-
   munmap(orig_in, queue_cur->len);
 
   if (in_buf != orig_in) ck_free(in_buf);
-
-  ck_free(position_map);
   ck_free(out_buf);
   ck_free(eff_map);
-  ck_free(branch_mask);
-  ck_free(orig_branch_mask);
-
 
   return ret_val;
 
@@ -8034,26 +7060,17 @@ static void usage(u8* argv0) {
 
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
        "  -n            - fuzz without instrumentation (dumb mode)\n"
-       "  -r            - (RB) add an additional trimming stage for rare branches\n"
-       "  -b            - (RB) disable the use of branch mask to guide execution\n"
-       "  -x dir        - optional fuzzer dictionary (see README)\n"
-       "  -q num        - (RB) bootstrap rare branches with:\n"
-       "                  num=1: regular AFL queueing until a new branch is discovered\n"
-       "                  num=2: regular AFL queueing, no determistic fuzzing,\n"
-       "                         until a new branch is discovered\n"
-       "                  num=3: regular AFL queueing for one cycle\n\n"
+       "  -x dir        - optional fuzzer dictionary (see README)\n\n"
 
        "Other stuff:\n\n"
 
        "  -T text       - text banner to show on the screen\n"
        "  -M / -S id    - distributed mode (see parallel_fuzzing.txt)\n"
        "  -C            - crash exploration mode (the peruvian rabbit thing)\n\n"
-       "  -s            - (RB) run in shadow mode (compare with and without branch mask)\n"
 
-       "For additional tips, please consult %s/README.\n"
-       "See %s/README.md for options marked (RB).\n\n",
+       "For additional tips, please consult %s/README.\n\n",
 
-       argv0, EXEC_TIMEOUT, MEM_LIMIT, doc_path, doc_path);
+       argv0, EXEC_TIMEOUT, MEM_LIMIT, doc_path);
 
   exit(1);
 
@@ -8696,9 +7713,6 @@ int main(int argc, char** argv) {
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
   char** use_argv;
 
-  blacklist = ck_alloc(sizeof(int) * blacklist_size);
-  blacklist[0] = -1;
-
   struct timeval tv;
   struct timezone tz;
 
@@ -8709,25 +7723,9 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+bq:rsi:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
 
     switch (opt) {
-
-      case 'b': /* disable use of branch mask */
-        use_branch_mask = 0;
-        break;
-
-      case 'q': /* bootstrap queueing after being stuck */
-        bootstrap = strtol(optarg, 0, 10);
-        break;
-
-      case 'r': /* trim for branch */
-        trim_for_branch = 1;
-        break;
-
-      case 's': /* run with shadow mode */
-        run_with_shadow = 1;
-        break;
 
       case 'i': /* input dir */
 
@@ -8957,12 +7955,6 @@ int main(int argc, char** argv) {
   setup_shm();
   init_count_class16();
 
-  memset(hit_bits, 0, sizeof(hit_bits));
-  if (in_place_resume) {
-    vanilla_afl = 0;
-    init_hit_bits();
-  }
-
   setup_dirs_fds();
   read_testcases();
   load_auto();
@@ -9010,17 +8002,10 @@ int main(int argc, char** argv) {
   while (1) {
 
     u8 skipped_fuzz;
+
     cull_queue();
 
     if (!queue_cur) {
-      DEBUG1("Entering new queueing cycle\n");
-      if (prev_cycle_wo_new && (bootstrap == 3)){
-        // only bootstrap for 1 cycle
-        prev_cycle_wo_new = 0;
-      } else {
-        prev_cycle_wo_new = cycle_wo_new;
-      }
-      cycle_wo_new = 1;
 
       queue_cycle++;
       current_entry     = 0;
@@ -9095,9 +8080,7 @@ stop_fuzzing:
 
   }
 
-  dump_to_logs();
   fclose(plot_file);
-  ck_free(blacklist);
   destroy_queue();
   destroy_extras();
   ck_free(target_path);
